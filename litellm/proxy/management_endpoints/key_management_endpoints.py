@@ -6831,7 +6831,13 @@ def _build_key_filter_conditions(
         else:
             user_condition["user_id"] = user_id
     if exclude_team_id and isinstance(exclude_team_id, str):
-        user_condition["team_id"] = {"not": exclude_team_id}
+        # SQL `team_id <> x` is UNKNOWN for NULL, so Prisma `{"not": x}` drops
+        # keys with no team. Preserve them — same pattern as
+        # `_get_condition_to_filter_out_ui_session_tokens` (#37292).
+        user_condition["OR"] = [
+            {"team_id": None},
+            {"team_id": {"not": exclude_team_id}},
+        ]
     if organization_id and isinstance(organization_id, str):
         user_condition["organization_id"] = organization_id
 
@@ -6887,7 +6893,14 @@ def _build_key_filter_conditions(
     if len(or_conditions) > 1:
         where = {"AND": [where, {"OR": or_conditions}]}
     elif len(or_conditions) == 1:
-        where.update(or_conditions[0])
+        single = or_conditions[0]
+        # where already has an OR from UI-session filtering; a visibility
+        # clause that also uses OR (exclude_team_id) must AND, not update,
+        # or it would clobber the UI-session predicate.
+        if "OR" in single and "OR" in where:
+            where = {"AND": [where, single]}
+        else:
+            where.update(single)
 
     # Apply team_id, project_id and access_group_id as global AND filters so they
     # narrow results across all visibility conditions (own keys, team keys, etc.)

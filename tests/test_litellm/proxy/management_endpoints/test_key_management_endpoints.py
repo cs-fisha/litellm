@@ -265,11 +265,14 @@ async def test_list_keys_include_created_by_keys():
         elif "created_by" in condition:
             created_by_condition_with_exclude = condition
 
-    # Verify exclude_team_id is applied to user condition
+    # Verify exclude_team_id produces an OR that keeps NULL team_id rows (#37292)
     assert (
         user_condition_with_exclude is not None
     ), "User condition with exclude should be present"
-    assert user_condition_with_exclude["team_id"] == {"not": "excluded-team-123"}
+    assert user_condition_with_exclude["OR"] == [
+        {"team_id": None},
+        {"team_id": {"not": "excluded-team-123"}},
+    ]
 
     # Verify created_by condition still only has created_by filter
     assert (
@@ -6822,6 +6825,59 @@ async def test_list_keys_team_admin_unaffected_by_member_permission_logic():
 
     admin_team_ids = helper_kwargs.get("admin_team_ids") or []
     assert team_id in admin_team_ids
+
+
+def test_build_key_filter_conditions_exclude_team_id_preserves_null_team():
+    """Regression for #37292: exclude_team_id must not drop keys where team_id IS NULL.
+
+    Prometheus key-budget init lists keys with exclude_team_id=litellm-dashboard
+    and user_id=None. The old `{"team_id": {"not": ...}}` predicate is UNKNOWN
+    for NULL in SQL and silently omitted every unassigned-team key.
+    """
+    from litellm.constants import UI_SESSION_TOKEN_TEAM_ID
+    from litellm.proxy.management_endpoints.key_management_endpoints import (
+        _build_key_filter_conditions,
+    )
+
+    null_or_not = [
+        {"team_id": None},
+        {"team_id": {"not": UI_SESSION_TOKEN_TEAM_ID}},
+    ]
+
+    # Prometheus-shaped call: no user_id, only exclude dashboard team
+    where = _build_key_filter_conditions(
+        user_id=None,
+        team_id=None,
+        organization_id=None,
+        key_alias=None,
+        key_hash=None,
+        exclude_team_id=UI_SESSION_TOKEN_TEAM_ID,
+        admin_team_ids=None,
+    )
+    # Old bug flattened to sibling team_id not-equal (AND) which drops NULLs
+    assert where.get("team_id") != {"not": UI_SESSION_TOKEN_TEAM_ID}
+    serialized = json.dumps(where)
+    assert '{"team_id": null}' in serialized
+    # Visibility clause ANDed with UI-session OR (both use OR keys)
+    assert where == {"AND": [{"OR": null_or_not}, {"OR": null_or_not}]}
+
+    # user_id + exclude_team_id: OR nested on the user visibility clause
+    where2 = _build_key_filter_conditions(
+        user_id="user-abc",
+        team_id=None,
+        organization_id=None,
+        key_alias=None,
+        key_hash=None,
+        exclude_team_id="excluded-team",
+        admin_team_ids=None,
+    )
+    assert where2["AND"][1] == {
+        "user_id": "user-abc",
+        "OR": [
+            {"team_id": None},
+            {"team_id": {"not": "excluded-team"}},
+        ],
+    }
 
 
 def test_build_key_filter_conditions_full_visibility_team_includes_service_accounts():
